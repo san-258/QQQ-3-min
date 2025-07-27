@@ -1,0 +1,223 @@
+import alpaca_trade_api as tradeapi
+import pandas as pd
+import ta
+import time
+from datetime import datetime, timedelta
+
+# --- Configuration ---
+# Make sure to set up your API keys and base URL
+# For live trading, use the live trading URL
+API_KEY = 'YOUR_ALPACA_API_KEY'
+API_SECRET = 'YOUR_ALPACA_SECRET_KEY'
+BASE_URL = 'https://api.alpaca.markets' # Live trading URL
+SYMBOL = 'QQQ'
+TIMEFRAME = '3Min'
+BUY_QUANTITY = 50
+PROFIT_TARGET_PERCENTAGE_OF_LENGTH = 0.015 # 1.5% of the red candle length
+
+
+# --- Initialize Alpaca API ---
+api = tradeapi.REST(API_KEY, API_SECRET, base_url=BASE_URL)
+
+# --- Global Variables to track the strategy state ---
+current_bars = pd.DataFrame()
+position_held = False
+entry_price = 0
+entry_timestamp = None
+red_candle_high = None
+red_candle_low = None
+red_candle_length = None
+crossover_found = False # To track if the 10/50 EMA crossover has happened
+red_candle_pattern_found = False # To track if the specific red candle after crossover is identified
+
+# --- Function to fetch historical data (useful for initial setup or catching up) ---
+def get_historical_data(symbol, timeframe, limit=1000):
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=7) # Fetch data for the last 7 days as a buffer
+    bars = api.get_bars(symbol, timeframe, start=start_date.strftime('%Y-%m-%d'), end=end_date.strftime('%Y-%m-%d'), limit=limit).df
+    return bars.sort_index() # Ensure data is sorted by timestamp
+
+# --- Function to calculate indicators ---
+def calculate_indicators(df):
+    if not df.empty:
+        # Calculate 10-period EMA
+        df['ema_10'] = ta.trend.ema_indicator(close=df['close'], window=10)
+        # Calculate 50-period EMA
+        df['ema_50'] = ta.trend.ema_indicator(close=df['close'], window=50)
+        # Drop rows with NaN values created by indicators
+        df.dropna(inplace=True)
+    return df
+
+# --- Function to check for the EMA crossover ---
+def check_crossover(df):
+    global crossover_found
+    if not df.empty and len(df) >= 2:
+        # Check for bullish crossover (10 EMA crosses above 50 EMA)
+        if (df['ema_10'].iloc[-1] > df['ema_50'].iloc[-1]) and \
+           (df['ema_10'].iloc[-2] <= df['ema_50'].iloc[-2]):
+            crossover_found = True
+            print(f"Bullish EMA crossover detected at {df.index[-1]}")
+
+# --- Function to find the first red candle after crossover ---
+def find_red_candle_after_crossover(df):
+    global red_candle_high, red_candle_low, red_candle_length, red_candle_pattern_found
+    if crossover_found and not red_candle_pattern_found:
+        # Filter for bars after the crossover point
+        bars_after_crossover = df[df.index >= df[
+             (df['ema_10'] > df['ema_50']) &
+             (df['ema_10'].shift(1) <= df['ema_50'].shift(1))
+        ].index[0]]
+
+        # Find the first red candle in the filtered data
+        red_candles = bars_after_crossover[bars_after_crossover['close'] < bars_after_crossover['open']]
+
+        if not red_candles.empty:
+            first_red_candle = red_candles.iloc[0]
+            red_candle_high = first_red_candle['high']
+            red_candle_low = first_red_candle['low']
+            red_candle_length = red_candle_high - red_candle_low
+            red_candle_pattern_found = True
+            print(f"First red candle after crossover identified at {first_red_candle.name}")
+            print(f"Red candle high: {red_candle_high:.2f}, low: {red_candle_low:.2f}, length: {red_candle_length:.2f}")
+
+
+# --- Function to check for buy signal and place order ---
+def check_buy_signal(df):
+    global position_held, entry_price, entry_timestamp
+    if red_candle_pattern_found and not position_held:
+        current_price_high = df['high'].iloc[-1]
+        if current_price_high > red_candle_high:
+            try:
+                # Place a market order to buy
+                order = api.submit_order(
+                    symbol=SYMBOL,
+                    qty=BUY_QUANTITY,
+                    side='buy',
+                    type='market',
+                    time_in_force='gtc' # Good 'Til Canceled
+                )
+                print(f"Buy order placed for {BUY_QUANTITY} shares of {SYMBOL} at {df.index[-1]}")
+                position_held = True
+                # Note: Entry price in live trading would be the execution price,
+                # which you can get from order updates. For simplicity here,
+                # we'll use the red candle high as the theoretical entry price.
+                entry_price = red_candle_high
+                entry_timestamp = df.index[-1]
+
+            except Exception as e:
+                print(f"Error placing buy order: {e}")
+
+# --- Function to check for exit signal and place order ---
+def check_sell_signal(df):
+    global position_held, red_candle_low, red_candle_length, entry_price
+    if position_held:
+        current_price_close = df['close'].iloc[-1]
+        current_price_high = df['high'].iloc[-1]
+
+        # Calculate profit target price
+        profit_target_price = red_candle_high + (red_candle_length * PROFIT_TARGET_PERCENTAGE_OF_LENGTH)
+
+        # Check for Profit Target or Stop Loss
+        if current_price_high >= profit_target_price:
+            try:
+                # Place a market order to sell (Profit Target)
+                 order = api.submit_order(
+                    symbol=SYMBOL,
+                    qty=position_held, # Sell the entire position
+                    side='sell',
+                    type='market',
+                    time_in_force='gtc'
+                )
+                 print(f"Sell order placed for {position_held} shares of {SYMBOL} at {df.index[-1]} (Profit Target)")
+                 position_held = False
+                 # Reset pattern tracking after exiting
+                 reset_strategy_state()
+
+            except Exception as e:
+                print(f"Error placing sell order (Profit Target): {e}")
+
+        elif current_price_close < red_candle_low:
+            try:
+                # Place a market order to sell (Stop Loss)
+                order = api.submit_order(
+                    symbol=SYMBOL,
+                    qty=position_held, # Sell the entire position
+                    side='sell',
+                    type='market',
+                    time_in_force='gtc'
+                )
+                print(f"Sell order placed for {position_held} shares of {SYMBOL} at {df.index[-1]} (Closed Below Red Candle Low)")
+                position_held = False
+                # Reset pattern tracking after exiting
+                reset_strategy_state()
+
+            except Exception as e:
+                print(f"Error placing sell order (Stop Loss): {e}")
+
+# --- Function to reset strategy state after an exit ---
+def reset_strategy_state():
+    global crossover_found, red_candle_pattern_found, red_candle_high, red_candle_low, red_candle_length
+    crossover_found = False
+    red_candle_pattern_found = False
+    red_candle_high = None
+    red_candle_low = None
+    red_candle_length = None
+    print("Strategy state reset after trade exit.")
+
+
+# --- Main trading loop (simplified - you would typically use streaming data) ---
+def live_trading_loop():
+    global current_bars
+    print("Starting simplified live trading loop...")
+    # Fetch some initial historical data to prime the indicators
+    current_bars = get_historical_data(SYMBOL, TIMEFRAME, limit=200) # Fetch enough data for indicators
+
+    while True:
+        # In a real bot, you would consume real-time data from a stream
+        # For this simplified example, we'll just wait and fetch the latest bar periodically
+        time.sleep(60) # Wait for 60 seconds (adjust based on timeframe)
+
+        try:
+            # Fetch the latest bar (you might need to adjust this to get the *completed* latest bar)
+            latest_bar_df = api.get_bars(SYMBOL, TIMEFRAME, limit=1).df
+            if not latest_bar_df.empty:
+                latest_bar = latest_bar_df.iloc[-1]
+
+                # Append the latest bar if it's new
+                if latest_bar.name not in current_bars.index:
+                    current_bars = pd.concat([current_bars, latest_bar_df])
+                    current_bars = current_bars.sort_index().tail(200) # Keep a rolling window of bars
+
+                    # Recalculate indicators on the updated data
+                    processed_bars = calculate_indicators(current_bars.copy())
+
+                    if not processed_bars.empty:
+                       # Check for EMA crossover
+                       if not crossover_found:
+                           check_crossover(processed_bars)
+
+                       # Find the red candle after crossover
+                       if crossover_found and not red_candle_pattern_found:
+                            find_red_candle_after_crossover(processed_bars)
+
+                       # Check for buy signal
+                       if red_candle_pattern_found and not position_held:
+                           check_buy_signal(processed_bars)
+
+                       # Check for sell signal (if holding a position)
+                       if position_held:
+                            check_sell_signal(processed_bars)
+
+        except Exception as e:
+            print(f"Error in trading loop: {e}")
+            # Implement more sophisticated error handling and potentially retry logic
+            time.sleep(10) # Wait before retrying
+
+# --- To run the simplified live trading loop (in a real bot, this would be managed differently) ---
+# This loop will run indefinitely until interrupted.
+# You would typically run this in a dedicated environment or server.
+# live_trading_loop()
+
+# print("\nSimplified live trading script outline generated.")
+# print("Remember to replace 'YOUR_ALPACA_API_KEY' and 'YOUR_ALPACA_SECRET_KEY' with your actual keys.")
+# print("This is a simplified example and needs significant additions for robust live trading.")
